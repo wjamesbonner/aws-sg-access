@@ -1,15 +1,18 @@
 param(
-    [Alias("s")]
+    [Alias("sf")]
     [string] $serviceFamily = "database-hosting",
 
     [Alias("t")]
     [string] $tagName = "service-family",
 
-    [Alias("i")]
+    [Alias("si")]
     [string] $serviceId  = "",
 
     [Alias("ti")]
     [string] $tagNameId = "service-id",
+
+    [Alias("ip")]
+    [string] $ipAddress = "",
 
     [Alias("d")]
     [switch] $debug = $false,
@@ -27,7 +30,7 @@ if ($help) {
 	Write-Output "`t serviceFamily"
 	Write-Output "`t     The name of the service family."
 	Write-Output ("`t     Default: {0}" -f $serviceFamily)
-    Write-Output "`t     Alias: s"
+    Write-Output "`t     Alias: sf"
 	Write-Output "`t     Example: ./aws_grant_mssql.ps1 -serviceFamily database-hosting"
     Write-Output "`t     Example: ./aws_grant_mssql.ps1 -s database-hosting"
 	
@@ -43,7 +46,7 @@ if ($help) {
 	Write-Output "`t serviceId"
 	Write-Output "`t     The name of the tag that stores the service family name"
 	Write-Output ("`t     Default: {0}" -f $serviceId)
-    Write-Output "`t     Alias: i"
+    Write-Output "`t     Alias: si"
 	Write-Output "`t     Example: ./aws_grant_mssql.ps1 -serviceId s1234567"
     Write-Output "`t     Example: ./aws_grant_mssql.ps1 -i s1234567"
 
@@ -52,6 +55,14 @@ if ($help) {
 	Write-Output "`t     The name of the tag that stores the service id"
 	Write-Output ("`t     Default: {0}" -f $tagNameId)
     Write-Output "`t     Alias: ti"
+	Write-Output "`t     Example: ./aws_grant_mssql.ps1 -tagNameId service-id"
+    Write-Output "`t     Example: ./aws_grant_mssql.ps1 -ti service-id"
+
+    Write-Output "`t "
+	Write-Output "`t ipAddress"
+	Write-Output "`t     The IP address to allow"
+	Write-Output ("`t     Default: {0}" -f $ipAddress)
+    Write-Output "`t     Alias: ip"
 	Write-Output "`t     Example: ./aws_grant_mssql.ps1 -tagNameId service-id"
     Write-Output "`t     Example: ./aws_grant_mssql.ps1 -ti service-id"
 
@@ -90,12 +101,17 @@ if ($tagNameId -eq "") {
 }
 $tagNameId = $tagNameId.ToLower()
 
+# Check for public IP
+if ($ipAddress -eq "") {
+	$publicIp = (Invoke-WebRequest -Uri "api.ipify.org").Content
+}
+
 # navigate to library root
 cd $PSScriptRoot
 
 if($debug) {
     $DebugPreference = "Continue"
-    $transcriptName = ("aws_cgrant_mssql-{0}.txt" -f [DateTimeOffset]::Now.ToUnixTimeSeconds())
+    $transcriptName = ("aws_grant_mssql-{0}.txt" -f [DateTimeOffset]::Now.ToUnixTimeSeconds())
     Start-Transcript -Path $transcriptName
 
     $serviceFamily
@@ -157,46 +173,35 @@ $serviceIdTags = Get-EC2Tag -Filter $filter
 
 if($securityGroupTags -eq $null -or $serviceFamilyTags -eq $null -or $serviceIdTags -eq $null) {
     Write-Debug "`t No security group matches all necessary criteria."
-    Stop-Transcript
+    if($debug){Stop-Transcript}
     return
 }
 
 Write-Debug "`t Verifying resource ID's match across all filters..."
-if($securityGroupTags.ResourceId -eq $serviceFamilyTags.ResourceId -and $securityGroupTags.ResourceId -eq $serviceIdTags.ResourceId) {
-    $parentSg = Get-EC2SecurityGroup -GroupId $securityGroupTags.ResourceId
+if($serviceFamilyTags.ResourceId.Contains($securityGroupTags.ResourceId) -and $serviceIdTags.ResourceId.Contains($securityGroupTags.ResourceId)) {
+    $sg = (Get-EC2SecurityGroup -GroupId $securityGroupTags.ResourceId)
 }
 
-if($parentSg -eq $null) {
+if($sg -eq $null) {
     Write-Debug "`t Mismatch of sg ID's across tag searches"
-    Stop-Transcript
+    if($debug){Stop-Transcript}
     return
 }
 
-Write-Debug "`t Creating and configuring new security group..."
-$sg = New-EC2SecurityGroup -GroupName ("{0}-{1}" -f $serviceFamily,[DateTimeOffset]::Now.ToUnixTimeSeconds()) -Description ("{0}-{1}" -f $serviceFamily,[DateTimeOffset]::Now.ToUnixTimeSeconds()) -VpcId $parentSg.VpcId
-$publicIp = (Invoke-WebRequest -Uri "api.ipify.org").Content
+Write-Debug "`t Configuring security group..."
 
-Write-Debug "`t Defining IP ranges and default egress rules..."
-$defaultIpRange = New-Object -TypeName Amazon.EC2.Model.IpRange
-$defaultIpRange.CidrIp = "0.0.0.0/0"
-#$defaultIpRange.Description = $null   # Do not set description or it will not match default egress rule.  
-                                # Powershell differentiates null and parameter not set. 
-                                # https://stackoverflow.com/questions/28697349/how-do-i-assign-a-null-value-to-a-variable-in-powershell
-Write-Debug $defaultIpRange
+
+Write-Debug "`t Creating management-task instructions..."
+$managementTaskHash = @{"management-task"="delete"; data=("{0}" -f [DateTimeOffset]::Now.AddHours(12).ToUnixTimeSeconds())}
+$managementTask = [PSCustomObject]$managementTaskHash
+$managementTask = ($managementTask | ConvertTo-Json -Depth 5 -Compress)
 
 $thisPcIpRange = New-Object -TypeName Amazon.EC2.Model.IpRange
 $thisPcIpRange.CidrIp = ("{0}/32" -f $publicIp)
-$thisPcIpRange.Description = ("automatic-{0}" -f [DateTimeOffset]::Now.ToUnixTimeSeconds())
+$thisPcIpRange.Description = ("json={0}" -f [System.Web.HttpUtility]::HtmlEncode($managementTask))
 Write-Debug $thisPcIpRange
 
-$outPermission = New-Object -TypeName Amazon.EC2.Model.IpPermission
-$outPermission.FromPort = 0
-$outPermission.IpProtocol = "-1"
-$outPermission.Ipv4Ranges = $defaultIpRange
-$outPermission.ToPort = 0
-Write-Debug $outPermission
-
-Write-Debug "`t Building security group ingress rules..."
+Write-Debug "`t Building security group ingress rule..."
 $mssqlPermission = New-Object -TypeName Amazon.EC2.Model.IpPermission
 $mssqlPermission.FromPort = 1433
 $mssqlPermission.IpProtocol = "tcp"
@@ -205,35 +210,11 @@ $mssqlPermission.ToPort = 1433
 Write-Debug $mssqlPermission
 
 Write-Debug "`t Applying ingress rules..."
-Grant-EC2SecurityGroupIngress -GroupId $sg -IpPermission $mssqlPermission
-
-Write-Debug "`t Revoking default egress rules..."
-Revoke-EC2SecurityGroupEgress -GroupId $sg -IpPermission $outPermission
-
-Write-Debug "`t Building inter-security group rules..."
-$groupPermissions = New-Object -TypeName Amazon.EC2.Model.UserIdGroupPair
-$groupPermissions.GroupId = $sg #Permission from this group
-$groupPermissions.UserId = $parentSg.GroupId #Permission to this group
-$groupPermissions.Description = ("automatic-{0}" -f [DateTimeOffset]::Now.ToUnixTimeSeconds())
-Write-Debug $groupPermissions
-
-$sgPermission = New-Object -TypeName Amazon.EC2.Model.IpPermission
-$sgPermission.FromPort = 1433
-$sgPermission.IpProtocol = "tcp"
-$sgPermission.ToPort = 1433
-$sgPermission.UserIdGroupPairs = $groupPermissions
-Write-Debug $sgPermission
-
-Write-Debug "`t Allowing access to service ports..."
-Grant-EC2SecurityGroupIngress -GroupId $parentSg.GroupId -IpPermission $sgPermission
-
-Write-Debug "`t Tagging security group..."
-New-EC2Tag -Resource $sg -Tag $nameTag
-New-EC2Tag -Resource $sg -Tag $serviceTag
-New-EC2Tag -Resource $sg -Tag $serviceIdTag
-New-EC2Tag -Resource $sg -Tag $managementTag
-New-EC2Tag -Resource $sg -Tag $managementTask
-New-EC2Tag -Resource $sg -Tag $managementData
+try{
+    Grant-EC2SecurityGroupIngress -GroupId $sg.GroupId -IpPermission $mssqlPermission 
+} catch {
+    Write-Debug "`t Rule already exists."
+}
 
 if($debug) {
     Stop-Transcript
