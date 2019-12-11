@@ -1,0 +1,41 @@
+import json
+import boto3
+import html
+import time
+
+def lambda_handler(event, context):
+    client = boto3.client('ec2')
+    
+    filters = [{'Name':'tag:management-mode', 'Values':['automatic']}]
+    response = client.describe_security_groups(Filters=filters)
+    groups = response['SecurityGroups']
+    purged = 0
+    
+    for group in groups:
+        for ipPermission in group['IpPermissions']:
+            delete = 0
+            
+            for ipRange in ipPermission['IpRanges']:
+                if 'Description' in ipRange:
+                    description = html.unescape(ipRange['Description'])
+                    if description.startswith('json='):
+                        task = description.replace('json=', '')
+                        task = json.loads(task)
+                        if 'management-task' in task and 'data' in task:
+                            if task['management-task'] == 'delete':
+                                deleteTime = int(task['data'])
+                                currentTime = int(time.time())
+                                if currentTime > deleteTime:
+                                    delete = 1
+                                    fromPort = ipPermission['FromPort']
+                                    toPort = ipPermission['ToPort']
+                                    cidrIp = ipRange['CidrIp']
+                                    ipProtocol = ipPermission['IpProtocol']
+            if delete == 1:
+                client.revoke_security_group_ingress(GroupId=group['GroupId'], IpProtocol=ipProtocol, FromPort=fromPort, ToPort=toPort, CidrIp=cidrIp)
+                purged = purged + 1
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps(purged)
+    }
